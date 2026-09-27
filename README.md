@@ -49,9 +49,11 @@ curl -s -X POST localhost:8080/api/releases/<releaseId>/rollback
 | 制品字节 | 固定格式清单头（service/commit/version/content-sha256）+ 原始 sourceContent |
 | artifactSha256 | 对“制品字节”整体取 SHA-256 |
 | 制品路径 | `<dataDir>/artifacts/<serviceName>/<artifactSha256>.bin`（内容寻址） |
-| releaseId | `rel-<commit 前 7 位>-<contentHash 前 12 位>` |
+| releaseId | `rel-<serviceName>-<commit 前 7 位>-<contentHash 前 12 位>`（**服务名参与身份**） |
 
 因此：**相同输入 ⇒ 相同 releaseId / version / artifactSha256 / 路径**；任一输入变化则全部变化。
+releaseId 必须携带服务名：单仓多服务场景下不同服务常打同一提交、同一内容，
+若身份不含服务名，这些发布会互相撞 ID、被误判为同一条。
 
 ### 非法与重复处理（静默覆盖被明确禁止）
 
@@ -164,7 +166,82 @@ PENDING ──advance(BUILD)──► IN_PROGRESS ──逐阶段推进──►
 
 ---
 
-## 5. 一致性机制（并发 / 重复 / 交叉）
+## 5. 发布组（单仓多服务批量编排）
+
+本仓库是单仓多服务：几个服务经常打同一个提交，甚至源码内容一模一样。
+**发布组**在此之上加一层批量编排：一次把一组服务（各自携带提交与内容）一起发起，
+组内每个服务仍然走自己的发布身份与阶段进度，互相不影响。
+
+```bash
+# 提交发布组：每个成员就是一条完整的单服务发布输入
+curl -s -X POST localhost:8080/api/release-groups -H 'Content-Type: application/json' -d '{
+  "groupKey":"ticket-2001",
+  "members":[
+    {"serviceName":"billing-api","commit":"0123456789abcdef0123456789abcdef01234567","sourceContent":"hello release"},
+    {"serviceName":"search-api","commit":"0123456789abcdef0123456789abcdef01234567","sourceContent":"hello release"},
+    {"serviceName":"edge-api","commit":"0123456789abcdef0123456789abcdef01234567","sourceContent":"edge src","faultInjection":"fail:CANARY"}
+  ]
+}'
+
+# 组级推进：每个可推进成员各自前进一个阶段（并行，互不影响）
+curl -s -X POST localhost:8080/api/release-groups/<groupId>/advance
+
+# 组级回滚：只回滚失败/推进中的成员，其余成员明确跳过
+curl -s -X POST localhost:8080/api/release-groups/<groupId>/rollback
+
+# 查询组（含派生组状态与每个成员的完整发布快照）
+curl -s localhost:8080/api/release-groups/<groupId>
+```
+
+### 身份与隔离规则
+
+- **成员身份**：成员的 releaseId 与单服务提交完全同源
+  （`rel-<serviceName>-<commit7>-<hash12>`）。组内多个服务用**同一提交、同一内容**时，
+  各自得到不同 releaseId、各自物化制品（制品清单含服务名）、各自写部署指针——
+  必须各自成立，不会互相顶掉，也不会被当成同一条发布；
+- **组身份**：`grp-<成员 releaseId 排序拼接后的 sha256 前 16 位>`，
+  与成员顺序、`groupKey` 无关。**相同成员集合重复/并发提交幂等返回既有组**，
+  不会产生第二个组或第二批发布；
+- **同源去重**：同一 `(serviceName, commit, content)` 若此前已通过单服务接口提交，
+  组提交会**收养**这条既有发布作为成员，而不是发起第二次部署；
+- **故障隔离**：组级推进/回滚只是“逐成员调用单服务编排 + 逐成员记录结论”。
+  某成员在某阶段失败时，只有它自己以 `FAILED` 终态停下（保留失败阶段与原因），
+  后续组级推进对它记 `SKIPPED`，其余成员照常推进；
+- **按服务回滚**：组级回滚只对 `FAILED`/`IN_PROGRESS` 的成员生效，
+  每个成员回滚到**它自己**的稳定版本登记册里的上一个稳定版本；
+  健康成员记 `SKIPPED`（`ROLLBACK_NOT_ALLOWED`），部署指针不动；
+- **组状态不持久化**，由成员状态实时推导（重启后天然一致）：
+  `PENDING`（全部待推进）、`IN_PROGRESS`（仍有成员在推进）、
+  `ROLLING_BACK`、`COMPLETED`（全部完成）、`FAILED`（无在推进且有失败）、
+  `ROLLED_BACK`（全部已回滚）、`PARTIAL`（其余混合终态）；
+- **校验**：组至少 1 个成员（否则 `INVALID_GROUP_REQUEST`）；
+  同一服务在组内只能出现一次（否则 `GROUP_DUPLICATE_SERVICE`，HTTP 409）；
+  成员入参与单服务提交同一套校验规则。
+
+### 并发与规模
+
+- 组级推进/回滚在成员间并行执行，并行度由
+  `release.orchestrator.group-parallelism`（默认 8）约束；
+  锁粒度仍是单个 releaseId，不同服务互不阻塞，
+  几十个服务一批提交时整体耗时随服务数近似线性增长；
+- 并发提交同一组：只建一个组（其余幂等返回同组或 `GROUP_BUSY`）；
+  并发对同组推进：单成员锁保证每个成员每个阶段恰好执行一次，不多发、不跳阶段；
+- 中断恢复：组成员就是普通发布，启动恢复扫描对组内成员逐一生效，
+  只把被中断的成员调和为 `FAILED(RECOVERED_AFTER_INTERRUPT)`，同伴原样保留，
+  重启后组可继续推进。
+
+### 与单服务用法的兼容关系
+
+- 单服务接口（`/api/releases/**`）行为完全不变；组成员就是一条普通发布，
+  可以用单服务接口查询、（在允许状态下）单独回滚；
+- 同一输入无论从单服务接口还是组接口进入，都收敛到同一条发布身份，
+  两条路径互为幂等，不会重复部署；
+- 唯一的行为收紧：releaseId 现在携带服务名（见第 2 节），
+  这使“不同服务、相同提交与内容”从过去的撞 ID 拒绝变为各自合法成立。
+
+---
+
+## 6. 一致性机制（并发 / 重复 / 交叉）
 
 - 每次 `submit / advance / rollback / recover` 都在临界区内执行：
   **按 releaseId 获取进程内 `ReentrantLock` + JVM 文件锁（`locks/<id>.lock`，可重入）
@@ -177,12 +254,13 @@ PENDING ──advance(BUILD)──► IN_PROGRESS ──逐阶段推进──►
 
 ---
 
-## 6. 本地数据目录布局（默认 `target/release-data`）
+## 7. 本地数据目录布局（默认 `target/release-data`）
 
 ```
 <dataDir>/
 ├── artifacts/<serviceName>/<artifactSha256>.bin   # 内容寻址制品（原子写入）
 ├── releases/<releaseId>.json                      # 每个发布的完整状态（原子替换）
+├── groups/<groupId>.json                          # 每个发布组的成员名册（原子替换，状态实时推导）
 ├── journal/events.log                             # 仅追加事件日志（单行 JSON，全局有序）
 ├── journal/events.lock                            # 事件日志跨进程锁
 ├── locks/<releaseId>.lock                         # 发布操作跨进程锁
@@ -194,17 +272,18 @@ PENDING ──advance(BUILD)──► IN_PROGRESS ──逐阶段推进──►
 
 ---
 
-## 7. 关键配置项（`src/main/resources/application.properties`）
+## 8. 关键配置项（`src/main/resources/application.properties`）
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `release.orchestrator.data-dir` | `target/release-data` | 本地状态与制品根目录；也可用环境变量 `RELEASE_DATA_DIR` 覆盖 |
 | `release.orchestrator.lock-timeout-millis` | `5000` | 同一发布并发操作的锁等待毫秒，超时返回 `RELEASE_BUSY` |
 | `release.orchestrator.recover-on-startup` | `true` | 启动时是否自动调和中断状态 |
+| `release.orchestrator.group-parallelism` | `8` | 发布组批量推进/回滚时的成员级并行度上限 |
 
 ---
 
-## 8. HTTP 接口与错误码
+## 9. HTTP 接口与错误码
 
 | 方法与路径 | 说明 |
 |------------|------|
@@ -213,14 +292,20 @@ PENDING ──advance(BUILD)──► IN_PROGRESS ──逐阶段推进──►
 | `POST /api/releases/{id}/rollback` | 回滚到上一个稳定版本 |
 | `GET  /api/releases/{id}` | 查询单个发布（含各阶段状态与失败原因） |
 | `GET  /api/releases` | 列出全部发布 |
+| `POST /api/release-groups` | 提交发布组（body 为 ReleaseGroupRequest；相同成员集合幂等返回既有组） |
+| `POST /api/release-groups/{id}/advance` | 组级推进：每个可推进成员各自前进一个阶段（逐成员结论） |
+| `POST /api/release-groups/{id}/rollback` | 组级回滚：只回滚失败/推进中的成员，其余跳过 |
+| `GET  /api/release-groups/{id}` | 查询组（派生组状态 + 每个成员的完整发布快照） |
+| `GET  /api/release-groups` | 列出全部发布组 |
 
 错误响应统一为 `{ timestamp, releaseId, code, message }`。HTTP 状态：
-`404`（`RELEASE_NOT_FOUND`）、`409`（并发冲突 / 非法流转 / 重复提交）、
+`404`（`RELEASE_NOT_FOUND` / `GROUP_NOT_FOUND`）、
+`409`（并发冲突 / 非法流转 / 重复提交 / 组内重复服务）、
 `400`（入参或制品校验等其余业务错误）。`code` 是稳定可区分的错误码。
 
 ---
 
-## 9. 本地验证方法（离线、确定性）
+## 10. 本地验证方法（离线、确定性）
 
 ```bash
 mvn -o clean test
@@ -238,6 +323,11 @@ mvn -o clean test
 | `InterruptionRecoveryTest` | 模拟阶段 RUNNING 中“被 kill”，用**全新 Spring 上下文**从同一磁盘重启：调和为 FAILED(RECOVERED_AFTER_INTERRUPT)、可回滚、重复恢复幂等、事件序号连续且历史完整；回滚中断后调和回 FAILED 可重试 |
 | `ArtifactGateAtStageTest` | BUILD 后篡改磁盘制品，STAGING 准入前校验失败并收敛为可解释终态 |
 | `ReleaseControllerWebTest` | HTTP 端到端：确定性提交、409/400/404 错误码区分、完整旅程后重复推进 409 |
+| `ReleaseGroupSubmitTest` | 组内跨服务相同提交+相同内容各自成立（独立身份/制品/指针）、组重复提交幂等、收养单服务既有发布、组入参校验码 |
+| `ReleaseGroupFailureIsolationTest` | 组内单服务 CANARY 失败只停自己（可解释终态+失败原因），同伴照常完成；按服务回滚到各自稳定版、健康成员跳过且指针不动；组成员可用单服务接口查询/回滚 |
+| `ReleaseGroupConcurrencyTest` | 12 线程并发提交同组只建一组；30 服务一批并行推进（每成员每阶段恰好一次、无串台、逐服务指针）；6 线程并发扫组仍保持阶段恰好一次 |
+| `ReleaseGroupRecoveryTest` | 组内成员 CANARY 执行中“被 kill”，全新 Spring 上下文重启：仅该成员调和为 FAILED(RECOVERED_AFTER_INTERRUPT)，同伴原样保留并继续走完，历史事件完整 |
+| `ReleaseGroupControllerWebTest` | 组 HTTP 端到端：提交-推进-查询全旅程、GROUP_NOT_FOUND/GROUP_DUPLICATE_SERVICE/INVALID_GROUP_REQUEST 映射 404/409/400 |
 
 ### 手动复现一次“失败 → 重启恢复 → 回滚”
 
@@ -247,3 +337,18 @@ mvn -o clean test
    `RECOVERED_AFTER_INTERRUPT` 调和；
 3. 先完整发布一个健康版本，再制造一个失败发布，调用 `/rollback`，
    检查 `deployments/<serviceName>/current.json` 是否切回上一个稳定版本。
+
+### 手动复现一次“发布组：组内失败隔离 → 按服务回滚”
+
+1. 先让 `svc-a` 完整发布一个健康版本（单服务接口提交 + 4 次 advance），成为它的稳定版本；
+2. 提交发布组：`svc-a` 携带新内容且 `faultInjection:"fail:CANARY"`，
+   `svc-b`、`svc-c` 健康（可与 svc-a 用同一 commit、同一内容，验证相同输入各自成立）；
+3. 连续调用 `POST /api/release-groups/<groupId>/advance` 4 次：
+   观察 `svc-a` 在 CANARY 以 `FAILED` 停下（后续轮次对它记 `SKIPPED`），
+   `svc-b`、`svc-c` 一路走到 `COMPLETED`，组状态推导为 `FAILED`；
+4. 调用 `POST /api/release-groups/<groupId>/rollback`：
+   只有 `svc-a` 回滚到自己的上一个稳定版本（`deployments/svc-a/current.json` 切回），
+   `svc-b`、`svc-c` 记 `SKIPPED` 且部署指针不动，组状态变为 `PARTIAL`；
+5. 中断恢复演练：在任一组成员某阶段 `RUNNING` 落盘后杀掉进程（或手工把
+   `releases/<id>.json` 中该阶段改为 `RUNNING`），重启应用，
+   观察仅该成员被调和为 `FAILED(RECOVERED_AFTER_INTERRUPT)`，其余成员与组记录原样保留。

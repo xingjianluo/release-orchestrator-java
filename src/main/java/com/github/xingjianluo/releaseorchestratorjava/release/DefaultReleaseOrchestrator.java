@@ -70,11 +70,20 @@ public class DefaultReleaseOrchestrator implements ReleaseOrchestrator {
         this.mapper = mapper;
     }
 
+    /**
+     * 发布身份派生：releaseId 绑定 (serviceName, commit, contentHash) 三元组。
+     * 服务名必须参与身份——单仓多服务场景下，不同服务常用同一提交、同一内容，
+     * 若身份不含服务名，组内相同输入会互相顶掉、被误判为同一条发布。
+     */
+    public static String releaseIdFor(String serviceName, String commit, String contentHash) {
+        return "rel-" + serviceName + "-" + commit.substring(0, 7) + "-" + contentHash.substring(0, 12);
+    }
+
     @Override
     public Release submit(ReleaseRequest request) {
         validate(request);
         String contentHash = versionCalculator.sha256Hex(request.sourceContent());
-        String releaseId = "rel-" + request.commit().substring(0, 7) + "-" + contentHash.substring(0, 12);
+        String releaseId = releaseIdFor(request.serviceName(), request.commit(), contentHash);
         log.info("submit input releaseId={} service={} commit={} contentLen={} idempotencyKey={} faultInjection={}",
                 releaseId, request.serviceName(), request.commit(),
                 request.sourceContent().length(), request.idempotencyKey(), request.faultInjection());

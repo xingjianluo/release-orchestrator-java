@@ -15,9 +15,11 @@ import java.util.Set;
 @RestControllerAdvice
 public class ReleaseExceptionHandler {
 
-    private static final Set<String> NOT_FOUND = Set.of("RELEASE_NOT_FOUND");
+    private static final Set<String> NOT_FOUND = Set.of("RELEASE_NOT_FOUND", "GROUP_NOT_FOUND");
     private static final Set<String> CONFLICT = Set.of(
             "RELEASE_BUSY",
+            "GROUP_BUSY",
+            "GROUP_DUPLICATE_SERVICE",
             "DUPLICATE_SUBMISSION",
             "RELEASE_FAILED",
             "RELEASE_ROLLING_BACK",
