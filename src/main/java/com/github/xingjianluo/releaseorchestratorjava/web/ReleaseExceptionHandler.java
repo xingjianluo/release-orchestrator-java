@@ -15,10 +15,15 @@ import java.util.Set;
 @RestControllerAdvice
 public class ReleaseExceptionHandler {
 
-    private static final Set<String> NOT_FOUND = Set.of("RELEASE_NOT_FOUND");
+    private static final Set<String> NOT_FOUND = Set.of(
+            "RELEASE_NOT_FOUND",
+            "GROUP_NOT_FOUND",
+            "GROUP_MEMBER_NOT_FOUND");
+
     private static final Set<String> CONFLICT = Set.of(
             "RELEASE_BUSY",
             "DUPLICATE_SUBMISSION",
+            "DUPLICATE_SERVICE_IN_GROUP",
             "RELEASE_FAILED",
             "RELEASE_ROLLING_BACK",
             "RELEASE_ROLLED_BACK",
@@ -34,18 +39,29 @@ public class ReleaseExceptionHandler {
                 : HttpStatus.BAD_REQUEST;
         ErrorResponse body = new ErrorResponse(
                 Instant.now(),
-                extractReleaseId(request.getRequestURI()),
+                extractResourceId(request.getRequestURI()),
                 ex.getCode(),
                 ex.getMessage());
         return ResponseEntity.status(status).body(body);
     }
 
-    private String extractReleaseId(String uri) {
-        int marker = uri.indexOf("/releases/");
-        if (marker < 0) {
+    /** 从 /releases/{id} 或 /release-groups/{id} 路径里提取资源 id，仅用于错误响应展示。 */
+    private String extractResourceId(String uri) {
+        String marker = null;
+        int at = -1;
+        int releaseMarker = uri.indexOf("/releases/");
+        int groupMarker = uri.indexOf("/release-groups/");
+        if (releaseMarker >= 0) {
+            marker = "/releases/";
+            at = releaseMarker;
+        } else if (groupMarker >= 0) {
+            marker = "/release-groups/";
+            at = groupMarker;
+        }
+        if (marker == null) {
             return null;
         }
-        String tail = uri.substring(marker + "/releases/".length());
+        String tail = uri.substring(at + marker.length());
         int slash = tail.indexOf('/');
         return slash < 0 ? tail : tail.substring(0, slash);
     }

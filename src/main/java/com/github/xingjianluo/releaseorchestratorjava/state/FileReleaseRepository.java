@@ -10,26 +10,20 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
-import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 /**
  * 文件系统发布存储：
  * <ul>
  *   <li>每个发布一个 JSON：releases/{releaseId}.json，先写 tmp 再原子替换；</li>
- *   <li>{@link #lock} 同时获取进程内锁与 .lock 文件锁，串行化并发推进；</li>
+ *   <li>{@link #lock} 委托给 {@link StateLockManager}（进程内锁 + .lock 文件锁），
+ *       串行化同一发布的并发推进，不同发布互不阻塞；</li>
  *   <li>损坏 JSON 抛 STATE_CORRUPT，绝不静默重建（历史不丢失/错乱）。</li>
  * </ul>
  */
@@ -40,20 +34,16 @@ public class FileReleaseRepository implements ReleaseRepository {
 
     private final ObjectMapper mapper;
     private final OrchestratorProperties properties;
-    private final ConcurrentHashMap<String, ReentrantLock> inProcessLocks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, FileChannel> heldChannels = new ConcurrentHashMap<>();
+    private final StateLockManager locks;
 
-    public FileReleaseRepository(OrchestratorProperties properties, ObjectMapper mapper) {
+    public FileReleaseRepository(OrchestratorProperties properties, ObjectMapper mapper, StateLockManager locks) {
         this.properties = properties;
         this.mapper = mapper;
+        this.locks = locks;
     }
 
     private Path releasesDir() {
         return properties.dataPath().resolve("releases");
-    }
-
-    private Path locksDir() {
-        return properties.dataPath().resolve("locks");
     }
 
     @Override
@@ -111,66 +101,12 @@ public class FileReleaseRepository implements ReleaseRepository {
 
     @Override
     public boolean lock(String releaseId, long timeoutMillis) {
-        ReentrantLock reentrantLock = inProcessLocks.computeIfAbsent(releaseId, k -> new ReentrantLock(true));
-        boolean reentrant = reentrantLock.isHeldByCurrentThread();
-        long deadline = System.currentTimeMillis() + timeoutMillis;
-        try {
-            if (!reentrantLock.tryLock(Math.max(1, timeoutMillis), TimeUnit.MILLISECONDS)) {
-                return false;
-            }
-            if (reentrant) {
-                // 同线程重入：文件锁仍由首次持有者掌握，直接成功。
-                return true;
-            }
-            Files.createDirectories(locksDir());
-            Path lockPath = locksDir().resolve(releaseId + ".lock");
-            FileChannel channel = FileChannel.open(lockPath,
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-            FileLock fileLock = null;
-            while (fileLock == null) {
-                try {
-                    fileLock = channel.tryLock();
-                } catch (OverlappingFileLockException ignore) {
-                    fileLock = null;
-                }
-                if (fileLock == null) {
-                    if (System.currentTimeMillis() >= deadline) {
-                        channel.close();
-                        reentrantLock.unlock();
-                        return false;
-                    }
-                    Thread.sleep(20);
-                }
-            }
-            heldChannels.put(releaseId, channel);
-            return true;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new ReleaseException("LOCK_INTERRUPTED", "interrupted while acquiring lock " + releaseId, e);
-        } catch (IOException e) {
-            reentrantLock.unlock();
-            throw new ReleaseException("LOCK_IO_ERROR", "failed to acquire lock " + releaseId + ": " + e.getMessage(), e);
-        }
+        return locks.lock(releaseId, timeoutMillis);
     }
 
     @Override
     public void unlock(String releaseId) {
-        ReentrantLock reentrantLock = inProcessLocks.get(releaseId);
-        if (reentrantLock == null || !reentrantLock.isHeldByCurrentThread()) {
-            return;
-        }
-        boolean lastHold = reentrantLock.getHoldCount() == 1;
-        if (lastHold) {
-            FileChannel channel = heldChannels.remove(releaseId);
-            if (channel != null) {
-                try {
-                    channel.close(); // 同时释放文件锁
-                } catch (IOException e) {
-                    log.warn("failed to close lock channel for {}: {}", releaseId, e.getMessage());
-                }
-            }
-        }
-        reentrantLock.unlock();
+        locks.unlock(releaseId);
     }
 
     private Release read(Path path) {

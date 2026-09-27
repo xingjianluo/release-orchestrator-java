@@ -18,6 +18,9 @@ public class OrchestratorProperties {
     /** 是否在启动时恢复中断状态（RUNNING 阶段）。 */
     private boolean recoverOnStartup = true;
 
+    /** 发布组并行推进成员时的最大并发度（不同服务并行，同服务仍按发布锁串行）。 */
+    private int groupAdvanceParallelism = 8;
+
     /**
      * 实时解析数据目录。不要在 Bean 构造函数中缓存结果：
      * ConfigurationProperties 的绑定发生在 Bean 构造之后，
@@ -33,4 +36,6 @@ public class OrchestratorProperties {
     public void setLockTimeoutMillis(long lockTimeoutMillis) { this.lockTimeoutMillis = lockTimeoutMillis; }
     public boolean isRecoverOnStartup() { return recoverOnStartup; }
     public void setRecoverOnStartup(boolean recoverOnStartup) { this.recoverOnStartup = recoverOnStartup; }
+    public int getGroupAdvanceParallelism() { return groupAdvanceParallelism; }
+    public void setGroupAdvanceParallelism(int groupAdvanceParallelism) { this.groupAdvanceParallelism = groupAdvanceParallelism; }
 }

@@ -74,7 +74,8 @@ public class DefaultReleaseOrchestrator implements ReleaseOrchestrator {
     public Release submit(ReleaseRequest request) {
         validate(request);
         String contentHash = versionCalculator.sha256Hex(request.sourceContent());
-        String releaseId = "rel-" + request.commit().substring(0, 7) + "-" + contentHash.substring(0, 12);
+        String releaseId = ReleaseIdentity.releaseId(
+                request.serviceName(), request.commit(), contentHash);
         log.info("submit input releaseId={} service={} commit={} contentLen={} idempotencyKey={} faultInjection={}",
                 releaseId, request.serviceName(), request.commit(),
                 request.sourceContent().length(), request.idempotencyKey(), request.faultInjection());

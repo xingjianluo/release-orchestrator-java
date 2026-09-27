@@ -1,6 +1,7 @@
 package com.github.xingjianluo.releaseorchestratorjava.release;
 
 import com.github.xingjianluo.releaseorchestratorjava.config.OrchestratorProperties;
+import com.github.xingjianluo.releaseorchestratorjava.group.release.ReleaseGroupOrchestrator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -10,9 +11,13 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * 启动恢复：进程可能在“阶段 RUNNING 已落盘、阶段完成未落盘”之间被 kill。
- * 重启时把残留 RUNNING 的阶段调和为 FAILED(RECOVERED_AFTER_INTERRUPT)，
- * 把残留 ROLLING_BACK 调和回 FAILED 等待重试。结论可解释、历史不丢失。
+ * 启动恢复，按顺序调和两层：
+ * <ol>
+ *   <li>单发布层：残留 RUNNING 阶段 → FAILED(RECOVERED_AFTER_INTERRUPT)，
+ *       残留 ROLLING_BACK → FAILED 等待重试；发布组的成员也是普通发布，一并覆盖；</li>
+ *   <li>发布组层：补齐中断窗口中缺失的成员，用成员权威状态刷新组快照。</li>
+ * </ol>
+ * 结论可解释、历史不丢失；两层恢复本身都幂等。
  */
 @Component
 public class StartupRecovery {
@@ -20,10 +25,14 @@ public class StartupRecovery {
     private static final Logger log = LoggerFactory.getLogger(StartupRecovery.class);
 
     private final ReleaseOrchestrator orchestrator;
+    private final ReleaseGroupOrchestrator groupOrchestrator;
     private final OrchestratorProperties properties;
 
-    public StartupRecovery(ReleaseOrchestrator orchestrator, OrchestratorProperties properties) {
+    public StartupRecovery(ReleaseOrchestrator orchestrator,
+                           ReleaseGroupOrchestrator groupOrchestrator,
+                           OrchestratorProperties properties) {
         this.orchestrator = orchestrator;
+        this.groupOrchestrator = groupOrchestrator;
         this.properties = properties;
     }
 
@@ -37,6 +46,10 @@ public class StartupRecovery {
         for (ReleaseOrchestrator.RecoveryResult result : results) {
             log.warn("recovered interrupted release={} stage={} -> status={}",
                     result.releaseId(), result.stage(), result.newStatus());
+        }
+        int groups = groupOrchestrator.recoverInterrupted();
+        if (groups > 0) {
+            log.warn("recovered {} interrupted release group(s)", groups);
         }
     }
 }

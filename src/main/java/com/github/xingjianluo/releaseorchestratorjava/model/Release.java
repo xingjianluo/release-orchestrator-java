@@ -8,6 +8,8 @@ import java.util.Map;
 public class Release {
 
     private String releaseId;
+    /** 所属发布组 ID；单服务提交为 null。组成员的发布身份仍各自独立。 */
+    private String groupId;
     private String serviceName;
     private String commit;
     private String contentHash;
@@ -78,6 +80,8 @@ public class Release {
 
     public String getReleaseId() { return releaseId; }
     public void setReleaseId(String releaseId) { this.releaseId = releaseId; }
+    public String getGroupId() { return groupId; }
+    public void setGroupId(String groupId) { this.groupId = groupId; }
     public String getServiceName() { return serviceName; }
     public void setServiceName(String serviceName) { this.serviceName = serviceName; }
     public String getCommit() { return commit; }
