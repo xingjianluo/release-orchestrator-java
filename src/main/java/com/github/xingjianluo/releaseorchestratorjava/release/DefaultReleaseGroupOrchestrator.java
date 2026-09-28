@@ -48,10 +48,19 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
 
     private static final Logger log = LoggerFactory.getLogger(DefaultReleaseGroupOrchestrator.class);
 
-    /** 组级推进时，成员处于这些状态视为“本轮无需动作”，记 SKIPPED 而非失败。 */
+    /**
+     * 组级推进时，成员处于这些（终态/禁止推进）状态视为“本轮无需动作”，
+     * 记 SKIPPED 并携带原有原因，而不是重新执行、更不是失败或成功。
+     */
     private static final Set<String> SKIP_ADVANCE_CODES = Set.of(
             "RELEASE_ALREADY_COMPLETED", "RELEASE_FAILED",
             "RELEASE_ROLLING_BACK", "RELEASE_ROLLED_BACK");
+
+    /**
+     * 成员锁正被另一个触发方持有（并发推进同一成员）时，本轮不执行该成员，
+     * 记 SKIPPED/BUSY；持锁方负责给出真实结论，绝不允许把忙等误报为失败或成功。
+     */
+    private static final String MEMBER_BUSY_CODE = "MEMBER_BUSY";
 
     private final ReleaseOrchestrator releaseOrchestrator;
     private final ReleaseRepository releaseRepository;
@@ -144,46 +153,110 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
     public GroupOperationResult advanceGroup(String groupId) {
         ReleaseGroup group = loadGroup(groupId);
         log.info("group advance requested groupId={} members={}", groupId, group.getMembers().size());
-        List<MemberOutcome> outcomes = runPerMember(group, "ADVANCE", member -> {
-            try {
-                releaseOrchestrator.advance(member.releaseId());
-                return MemberOutcome.success(member.serviceName(), member.releaseId(), "ADVANCE");
-            } catch (ReleaseException e) {
-                String action = SKIP_ADVANCE_CODES.contains(e.getCode()) ? "SKIPPED" : "ADVANCE";
+        // 组锁串行化同一组的并发扫描：任一轮推进的临界区（逐成员执行 + 汇总 + 事件）
+        // 互不交叠，并发触发只会排队得到“真实执行”或“跳过”的稳定结论，
+        // 不会出现两条扫描同时写同一成员、结论互相覆盖。
+        if (!groupRepository.lock(groupId, properties.getLockTimeoutMillis())) {
+            throw new ReleaseException("GROUP_BUSY", "group is being advanced concurrently: " + groupId);
+        }
+        try {
+            List<MemberOutcome> outcomes = runPerMember(group, "ADVANCE", this::advanceMember);
+            journal.append(groupId, "GROUP_ADVANCE_SWEEP", summarize(outcomes));
+            return new GroupOperationResult(groupId, "ADVANCE", outcomes, view(group));
+        } finally {
+            groupRepository.unlock(groupId);
+        }
+    }
+
+    /**
+     * 单个成员推进一轮的结论判定。语义必须与成员真实结果严格一致：
+     * <ul>
+     *   <li>阶段真正执行并通过 → SUCCESS；</li>
+     *   <li>阶段执行失败（单服务编排把成员置为 FAILED 终态后正常返回）
+     *       → 本轮必须明确返回 FAILED 结论并带上失败阶段/错误码/原因，
+     *       不能因为没有抛异常就误记成功；</li>
+     *   <li>成员已在失败/回滚/完成等终态 → SKIPPED，保留既有原因，不重跑；</li>
+     *   <li>成员锁被并发触发方持有 → SKIPPED/MEMBER_BUSY，由持锁方给真实结论。</li>
+     * </ul>
+     */
+    private MemberOutcome advanceMember(ReleaseGroup.Member member) {
+        Release before = releaseRepository.find(member.releaseId()).orElse(null);
+        Release result;
+        try {
+            result = releaseOrchestrator.advance(member.releaseId());
+        } catch (ReleaseException e) {
+            if (SKIP_ADVANCE_CODES.contains(e.getCode())) {
                 return MemberOutcome.failure(member.serviceName(), member.releaseId(),
-                        action, e.getCode(), e.getMessage());
+                        "SKIPPED", e.getCode(), e.getMessage());
             }
-        });
-        journal.append(groupId, "GROUP_ADVANCE_SWEEP", summarize(outcomes));
-        return new GroupOperationResult(groupId, "ADVANCE", outcomes, view(group));
+            if ("RELEASE_BUSY".equals(e.getCode())) {
+                return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                        "SKIPPED", MEMBER_BUSY_CODE,
+                        "member is being advanced by another trigger this round: " + e.getMessage());
+            }
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                    "ADVANCE", e.getCode(), e.getMessage());
+        }
+        if (result.getStatus() == ReleaseStatus.FAILED) {
+            // 关键：advance() 阶段失败时是“落 FAILED 终态后正常返回”而不是抛异常，
+            // 组级结论必须以成员落盘状态为准，否则会把失败谎报为成功。
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(), "ADVANCE",
+                    result.getFailureCode(), describeFailure(result));
+        }
+        if (before != null && before.getStatus() == ReleaseStatus.FAILED
+                && result.getStatus() != ReleaseStatus.FAILED) {
+            // 状态防线：失败终态绝不可能因一次推进被翻成成功。理论不可达。
+            throw new ReleaseException("STATE_CORRUPT",
+                    "member " + member.releaseId() + " escaped terminal FAILED via advance");
+        }
+        return MemberOutcome.success(member.serviceName(), member.releaseId(), "ADVANCE");
+    }
+
+    /** 失败说明要让调用方无需再查组详情即可定位：阶段 + 错误码 + 原始原因。 */
+    private String describeFailure(Release release) {
+        return "stage " + release.getFailureStage() + " failed with "
+                + release.getFailureCode() + ": " + release.getFailureReason();
     }
 
     @Override
     public GroupOperationResult rollbackGroup(String groupId) {
         ReleaseGroup group = loadGroup(groupId);
         log.info("group rollback requested groupId={} members={}", groupId, group.getMembers().size());
-        List<MemberOutcome> outcomes = runPerMember(group, "ROLLBACK", member -> {
-            Release release = releaseRepository.find(member.releaseId())
-                    .orElseThrow(() -> new ReleaseException("STATE_CORRUPT",
-                            "group member release missing: " + member.releaseId()));
-            // 只有失败/推进中/已回滚（幂等）的成员需要动作；其余明确跳过，互不牵连。
-            if (release.getStatus() != ReleaseStatus.FAILED
-                    && release.getStatus() != ReleaseStatus.IN_PROGRESS
-                    && release.getStatus() != ReleaseStatus.ROLLED_BACK) {
-                return MemberOutcome.failure(member.serviceName(), member.releaseId(), "SKIPPED",
-                        "ROLLBACK_NOT_ALLOWED",
-                        "member is " + release.getStatus() + "; only failed/in-progress members roll back");
-            }
-            try {
-                releaseOrchestrator.rollback(member.releaseId());
-                return MemberOutcome.success(member.serviceName(), member.releaseId(), "ROLLBACK");
-            } catch (ReleaseException e) {
-                return MemberOutcome.failure(member.serviceName(), member.releaseId(),
-                        "ROLLBACK", e.getCode(), e.getMessage());
-            }
-        });
-        journal.append(groupId, "GROUP_ROLLBACK_SWEEP", summarize(outcomes));
-        return new GroupOperationResult(groupId, "ROLLBACK", outcomes, view(group));
+        // 与推进共用同一把组锁：回滚扫描与推进扫描互不交叠，避免成员结论串台。
+        if (!groupRepository.lock(groupId, properties.getLockTimeoutMillis())) {
+            throw new ReleaseException("GROUP_BUSY", "group is being operated on concurrently: " + groupId);
+        }
+        try {
+            List<MemberOutcome> outcomes = runPerMember(group, "ROLLBACK", member -> {
+                Release release = releaseRepository.find(member.releaseId())
+                        .orElseThrow(() -> new ReleaseException("STATE_CORRUPT",
+                                "group member release missing: " + member.releaseId()));
+                // 只有失败/推进中/已回滚（幂等）的成员需要动作；其余明确跳过，互不牵连。
+                if (release.getStatus() != ReleaseStatus.FAILED
+                        && release.getStatus() != ReleaseStatus.IN_PROGRESS
+                        && release.getStatus() != ReleaseStatus.ROLLED_BACK) {
+                    return MemberOutcome.failure(member.serviceName(), member.releaseId(), "SKIPPED",
+                            "ROLLBACK_NOT_ALLOWED",
+                            "member is " + release.getStatus() + "; only failed/in-progress members roll back");
+                }
+                try {
+                    releaseOrchestrator.rollback(member.releaseId());
+                    return MemberOutcome.success(member.serviceName(), member.releaseId(), "ROLLBACK");
+                } catch (ReleaseException e) {
+                    if ("RELEASE_BUSY".equals(e.getCode())) {
+                        return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                                "SKIPPED", MEMBER_BUSY_CODE,
+                                "member is being operated on by another trigger this round: " + e.getMessage());
+                    }
+                    return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                            "ROLLBACK", e.getCode(), e.getMessage());
+                }
+            });
+            journal.append(groupId, "GROUP_ROLLBACK_SWEEP", summarize(outcomes));
+            return new GroupOperationResult(groupId, "ROLLBACK", outcomes, view(group));
+        } finally {
+            groupRepository.unlock(groupId);
+        }
     }
 
     /**
@@ -264,7 +337,11 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
                 deriveStatus(releases), releases);
     }
 
-    /** 组状态完全由成员状态推导，不持久化，重启后天然一致。 */
+    /**
+     * 组状态完全由成员状态推导，不持久化，重启后天然一致。
+     * 失败终态优先：只要有成员 FAILED，组就是 FAILED——即使其他成员仍在推进中，
+     * 这样“某轮有成员失败”时组状态与该轮逐成员结论保持一致，不会被活跃成员掩盖。
+     */
     static GroupStatus deriveStatus(List<Release> releases) {
         boolean anyRollingBack = releases.stream().anyMatch(r -> r.getStatus() == ReleaseStatus.ROLLING_BACK);
         if (anyRollingBack) {
@@ -273,6 +350,10 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
         boolean allPending = releases.stream().allMatch(r -> r.getStatus() == ReleaseStatus.PENDING);
         if (allPending) {
             return GroupStatus.PENDING;
+        }
+        boolean anyFailed = releases.stream().anyMatch(r -> r.getStatus() == ReleaseStatus.FAILED);
+        if (anyFailed) {
+            return GroupStatus.FAILED;
         }
         boolean anyActive = releases.stream().anyMatch(r ->
                 r.getStatus() == ReleaseStatus.PENDING || r.getStatus() == ReleaseStatus.IN_PROGRESS);
@@ -286,10 +367,6 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
         boolean allRolledBack = releases.stream().allMatch(r -> r.getStatus() == ReleaseStatus.ROLLED_BACK);
         if (allRolledBack) {
             return GroupStatus.ROLLED_BACK;
-        }
-        boolean anyFailed = releases.stream().anyMatch(r -> r.getStatus() == ReleaseStatus.FAILED);
-        if (anyFailed) {
-            return GroupStatus.FAILED;
         }
         return GroupStatus.PARTIAL;
     }

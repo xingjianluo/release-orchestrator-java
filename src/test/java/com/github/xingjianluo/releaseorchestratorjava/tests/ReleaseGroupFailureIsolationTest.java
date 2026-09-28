@@ -112,6 +112,106 @@ class ReleaseGroupFailureIsolationTest extends AbstractOrchestratorTest {
     }
 
     @Test
+    void failingMemberIsReportedFailedInTheSweepItFailsAndSkippedAfterwards() {
+        ReleaseGroupView group = groups.submitGroup(new ReleaseGroupRequest("ticket-same-round", List.of(
+                member("svc-good-1", COMMIT, "same-round-one", null),
+                member("svc-good-2", COMMIT, "same-round-two", null),
+                member("svc-loser", COMMIT, "same-round-loser", "fail:CANARY"))));
+
+        MemberOutcome loser;
+        MemberOutcome good1;
+
+        // 第 1 轮 BUILD：三个成员都真正执行并成功，结论各自为 ADVANCE/SUCCESS。
+        GroupOperationResult build = groups.advanceGroup(group.groupId());
+        loser = outcomeOf(build, "svc-loser");
+        good1 = outcomeOf(build, "svc-good-1");
+        assertTrue(loser.ok(), "loser passes BUILD: " + loser);
+        assertEquals("ADVANCE", loser.action());
+        assertTrue(good1.ok());
+
+        // 第 2 轮 STAGING：同样全部成功。
+        GroupOperationResult staging = groups.advanceGroup(group.groupId());
+        assertTrue(outcomeOf(staging, "svc-loser").ok(), "loser passes STAGING");
+
+        // 第 3 轮 CANARY：svc-loser 本轮阶段执行失败——
+        // 关键断言：这一轮返回的逐成员结论里它就必须是失败，带可识别原因，
+        // 不允许记成成功，也不要求调用方再查一次组详情。
+        GroupOperationResult canary = groups.advanceGroup(group.groupId());
+        loser = outcomeOf(canary, "svc-loser");
+        testLog.info("CANARY sweep outcomes={}", canary.outcomes());
+        assertEquals(false, loser.ok(), "loser must be reported failed in the very sweep it fails: " + loser);
+        assertEquals("ADVANCE", loser.action(), "failure happened while executing a stage, not a skip");
+        assertEquals("CANARY_HEALTH_CHECK_FAILED", loser.code(),
+                "identifiable failure code returned inline");
+        assertNotNull(loser.message(), "failure explanation returned inline");
+        assertTrue(loser.message().contains("CANARY"), "message names the failing stage: " + loser.message());
+        assertTrue(loser.message().contains("CANARY_HEALTH_CHECK_FAILED"),
+                "message carries the failure code: " + loser.message());
+
+        // 同轮其他成员不受牵连：继续推进并拿到自己的成功结论。
+        for (String healthy : List.of("svc-good-1", "svc-good-2")) {
+            MemberOutcome o = outcomeOf(canary, healthy);
+            assertTrue(o.ok(), healthy + " keeps advancing while loser fails: " + o);
+            assertEquals("ADVANCE", o.action());
+        }
+        // 组状态与逐成员结论一致：组 FAILED。
+        assertEquals(GroupStatus.FAILED, canary.group().status());
+        Release loserNow = memberOf(canary.group(), "svc-loser");
+        assertEquals(ReleaseStatus.FAILED, loserNow.getStatus());
+        assertEquals(StageName.CANARY, loserNow.getFailureStage());
+
+        // 第 4 轮及后续每轮：失败终态成员只能记 SKIPPED 并保留原失败原因，
+        // 不能重跑 CANARY、不能再算成功；健康成员继续走完剩余阶段。
+        GroupOperationResult production = groups.advanceGroup(group.groupId());
+        loser = outcomeOf(production, "svc-loser");
+        assertEquals("SKIPPED", loser.action(), "terminal-failed member is never re-run: " + loser);
+        assertEquals(false, loser.ok());
+        assertEquals("RELEASE_FAILED", loser.code());
+        assertNotNull(loser.message());
+        assertTrue(loser.message().contains("CANARY"), "skip reason retains original failing stage");
+        assertTrue(loser.message().contains("CANARY_HEALTH_CHECK_FAILED"),
+                "skip reason retains original failure code: " + loser.message());
+        for (String healthy : List.of("svc-good-1", "svc-good-2")) {
+            assertTrue(outcomeOf(production, healthy).ok(), healthy + " advances PRODUCTION");
+        }
+
+        // 再来几轮，结论保持稳定：永远跳过、永远保留原失败原因。
+        for (int i = 0; i < 3; i++) {
+            GroupOperationResult extra = groups.advanceGroup(group.groupId());
+            MemberOutcome skipped = outcomeOf(extra, "svc-loser");
+            assertEquals("SKIPPED", skipped.action(), "still skipped on repeat sweep " + i);
+            assertEquals("RELEASE_FAILED", skipped.code());
+            assertTrue(skipped.message().contains("CANARY_HEALTH_CHECK_FAILED"));
+            for (String healthy : List.of("svc-good-1", "svc-good-2")) {
+                MemberOutcome ho = outcomeOf(extra, healthy);
+                assertEquals("SKIPPED", ho.action(), healthy + " completed -> skipped, never re-deployed");
+                assertEquals("RELEASE_ALREADY_COMPLETED", ho.code());
+            }
+            assertEquals(GroupStatus.FAILED, extra.group().status(),
+                    "group status stays consistent with member outcomes");
+        }
+
+        ReleaseGroupView done = groups.getGroup(group.groupId());
+        assertEquals(ReleaseStatus.FAILED, memberOf(done, "svc-loser").getStatus());
+        assertEquals("CANARY_HEALTH_CHECK_FAILED", memberOf(done, "svc-loser").getFailureCode(),
+                "persisted failure reason never overwritten");
+        assertEquals(ReleaseStatus.COMPLETED, memberOf(done, "svc-good-1").getStatus());
+        assertEquals(ReleaseStatus.COMPLETED, memberOf(done, "svc-good-2").getStatus());
+        // 失败成员的 CANARY 只执行过一次：没有重跑、没有重复部署。
+        long loserCanaryStarts = journal.readAll().stream()
+                .filter(e -> e.releaseId().equals(memberOf(done, "svc-loser").getReleaseId()))
+                .filter(e -> "STAGE_STARTED".equals(e.type()) && e.detail().contains("stage=CANARY"))
+                .count();
+        assertEquals(1L, loserCanaryStarts, "loser CANARY runs exactly once despite repeated sweeps");
+        testLog.info("final state: loser reported failed in failing round and skipped ever after; peers completed");
+    }
+
+    private static MemberOutcome outcomeOf(GroupOperationResult result, String service) {
+        return result.outcomes().stream()
+                .filter(o -> o.serviceName().equals(service)).findFirst().orElseThrow();
+    }
+
+    @Test
     void memberRollbackViaSingleServiceApiDoesNotAffectGroupPeers() {
         ReleaseGroupView group = groups.submitGroup(new ReleaseGroupRequest("ticket-peer", List.of(
                 member("svc-peer-1", COMMIT, "peer-one", null),

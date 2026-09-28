@@ -76,6 +76,8 @@ class ReleaseGroupRecoveryTest extends AbstractOrchestratorTest {
                 group.groupId());
 
         try (ConfigurableApplicationContext restarted = restartContext()) {
+            // 重启时间基准：重启后不允许为被调和成员追加任何 STAGE_STARTED。
+            Instant restartedAt = Instant.now();
             ReleaseOrchestrator recoveredReleases = restarted.getBean(ReleaseOrchestrator.class);
             ReleaseGroupOrchestrator recoveredGroups = restarted.getBean(ReleaseGroupOrchestrator.class);
 
@@ -97,11 +99,32 @@ class ReleaseGroupRecoveryTest extends AbstractOrchestratorTest {
                 assertEquals(StageStatus.PASSED, p.getStages().get(StageName.STAGING).getStatus());
                 assertEquals(StageStatus.PENDING, p.getStages().get(StageName.CANARY).getStatus());
             }
-            assertEquals(GroupStatus.IN_PROGRESS, view.status());
+            // 已有成员处于失败终态时，组状态即 FAILED，与逐成员结论保持一致：
+            // 不会因为其他成员仍 IN_PROGRESS 就把失败掩盖掉。
+            assertEquals(GroupStatus.FAILED, view.status());
 
-            // 重启后继续推进：同伴走完全程，被调和成员保持失败终态不再动作。
-            GroupOperationResult last = null;
-            for (int i = 0; i < 3; i++) {
+            // 重启后第一轮推进：失败成员立即记 SKIPPED 并带回恢复时调和出的失败原因，
+            // 调用方无需再查一次组详情；健康成员各自推进 CANARY。
+            GroupOperationResult firstSweep = recoveredGroups.advanceGroup(group.groupId());
+            MemberOutcome r2First = firstSweep.outcomes().stream()
+                    .filter(o -> o.serviceName().equals("svc-r2")).findFirst().orElseThrow();
+            assertEquals("SKIPPED", r2First.action(),
+                    "recovered terminal-failed member is not re-run on first post-restart sweep");
+            assertEquals(false, r2First.ok());
+            assertEquals("RELEASE_FAILED", r2First.code());
+            assertTrue(r2First.message().contains("RECOVERED_AFTER_INTERRUPT"),
+                    "first post-restart sweep retains recovered failure reason: " + r2First.message());
+            assertTrue(r2First.message().contains("CANARY"),
+                    "skip reason names the recovered failing stage: " + r2First.message());
+            for (String peer : List.of("svc-r1", "svc-r3")) {
+                MemberOutcome po = firstSweep.outcomes().stream()
+                        .filter(o -> o.serviceName().equals(peer)).findFirst().orElseThrow();
+                assertTrue(po.ok(), peer + " keeps advancing after restart: " + po);
+            }
+
+            // 后续两轮：同伴走完全程，被调和成员保持失败终态不再动作。
+            GroupOperationResult last = firstSweep;
+            for (int i = 0; i < 2; i++) {
                 last = recoveredGroups.advanceGroup(group.groupId());
             }
             ReleaseGroupView done = recoveredGroups.getGroup(group.groupId());
@@ -111,15 +134,24 @@ class ReleaseGroupRecoveryTest extends AbstractOrchestratorTest {
             assertEquals(ReleaseStatus.FAILED, r2Final.getStatus());
             assertEquals("RECOVERED_AFTER_INTERRUPT", r2Final.getFailureCode(),
                     "failure reason survives restart and later sweeps");
+            assertEquals(StageName.CANARY, r2Final.getFailureStage());
             assertEquals(GroupStatus.FAILED, done.status());
             MemberOutcome r2Outcome = last.outcomes().stream()
                     .filter(o -> o.serviceName().equals("svc-r2")).findFirst().orElseThrow();
             assertEquals("SKIPPED", r2Outcome.action());
             assertEquals("RELEASE_FAILED", r2Outcome.code());
-
+            assertTrue(r2Outcome.message().contains("RECOVERED_AFTER_INTERRUPT"),
+                    "later sweeps keep the recovered failure reason: " + r2Outcome.message());
             // 历史不丢失：失败成员的事件轨迹完整（提交、各阶段、失败）。
             var journal = restarted.getBean(com.github.xingjianluo.releaseorchestratorjava
                     .state.EventJournal.class);
+            // 重启后失败成员从未重新执行任何阶段：没有重复部署。
+            long r2RestartedStageStarts = journal.readAll().stream()
+                    .filter(e -> e.releaseId().equals(crashed.getReleaseId()))
+                    .filter(e -> "STAGE_STARTED".equals(e.type()) && !e.at().isBefore(restartedAt))
+                    .count();
+            assertEquals(0L, r2RestartedStageStarts,
+                    "recovered terminal-failed member is never re-executed after restart");
             List<String> r2Events = journal.readAll().stream()
                     .filter(e -> e.releaseId().equals(crashed.getReleaseId()))
                     .map(e -> e.type()).toList();
