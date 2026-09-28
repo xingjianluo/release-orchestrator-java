@@ -206,7 +206,10 @@ curl -s localhost:8080/api/release-groups/<groupId>
   组提交会**收养**这条既有发布作为成员，而不是发起第二次部署；
 - **故障隔离**：组级推进/回滚只是“逐成员调用单服务编排 + 逐成员记录结论”。
   某成员在某阶段失败时，只有它自己以 `FAILED` 终态停下（保留失败阶段与原因），
-  后续组级推进对它记 `SKIPPED`，其余成员照常推进；
+  **失败发生的那一轮**的逐成员结论就是失败（`action=ADVANCE, ok=false`，
+  带阶段失败码与可读原因），同一轮其余成员照常推进；
+  后续每轮组级推进对它只记跳过（`action=SKIPPED, ok=false, code=RELEASE_FAILED`）并
+  原样带回失败阶段、失败码与原因，绝不重新执行阶段或重复部署；
 - **按服务回滚**：组级回滚只对 `FAILED`/`IN_PROGRESS` 的成员生效，
   每个成员回滚到**它自己**的稳定版本登记册里的上一个稳定版本；
   健康成员记 `SKIPPED`（`ROLLBACK_NOT_ALLOWED`），部署指针不动；
@@ -217,6 +220,38 @@ curl -s localhost:8080/api/release-groups/<groupId>
 - **校验**：组至少 1 个成员（否则 `INVALID_GROUP_REQUEST`）；
   同一服务在组内只能出现一次（否则 `GROUP_DUPLICATE_SERVICE`，HTTP 409）；
   成员入参与单服务提交同一套校验规则。
+
+### 逐成员结论判定语义（`MemberOutcome`）
+
+每次组级推进的返回值 `GroupOperationResult.outcomes[]` 对组内每个服务给出一条
+`MemberOutcome{serviceName, releaseId, action, ok, code, message}`，
+**调用方只看这一轮的返回值就能知道每个服务这一轮到底成功、失败还是未执行，
+不需要再查一次组详情**。判定严格以成员发布的真实状态为准：
+
+| 成员本轮情况 | `action` | `ok` | `code` | 说明 |
+| --- | --- | --- | --- | --- |
+| 本轮执行了一个阶段且通过 | `ADVANCE` | `true` | 空 | 阶段真实落盘为 PASSED |
+| **本轮阶段执行失败** | `ADVANCE` | `false` | 阶段失败码，如 `CANARY_HEALTH_CHECK_FAILED` / `PRODUCTION_HEALTH_CHECK_FAILED` / `BUILD_HEALTH_CHECK_FAILED` | `message` 带失败阶段与原因；成员同步进入 `FAILED` 终态，同轮其他成员继续推进 |
+| 已在 `FAILED` 终态（含历史失败、重启调和失败） | `SKIPPED` | `false` | `RELEASE_FAILED` | `message` 原样带回失败阶段、失败码与失败原因；不重跑阶段、不重复部署，也不会再被记成功 |
+| 已 `COMPLETED` | `SKIPPED` | `false` | `RELEASE_ALREADY_COMPLETED` | 幂等无动作 |
+| `ROLLING_BACK` / `ROLLED_BACK` | `SKIPPED` | `false` | `RELEASE_ROLLING_BACK` / `RELEASE_ROLLED_BACK` | 推进被禁止，无动作 |
+| 与并发的另一轮推进撞锁 | `SKIPPED` | `false` | `RELEASE_BUSY` | 本轮未执行，让拿到锁的那一轮给出唯一结论 |
+| 阶段残留 `RUNNING`（中断后尚未恢复） | `SKIPPED` | `false` | `MEMBER_INTERRUPTED_RUNNING` | 不重跑该阶段，提示先做恢复 |
+
+要点：
+
+- **结论与真实状态同源**：组推进不持久化自己的结论，每轮都从成员发布的最新状态
+  （磁盘 JSON）推导；单服务层在阶段失败时是“正常返回 FAILED 发布”，组层必须检查
+  返回发布的终态，而不能只看“有没有抛异常”——这正是逐成员结论曾经被错记成成功的根因；
+- **失败终态不可逆**：`FAILED` 成员后续每轮都只可能是 `SKIPPED(RELEASE_FAILED)`，
+  其失败阶段/码/原因在每轮返回值、组详情、事件日志三处保持一致，只能通过
+  按服务回滚或重新提交新版本离开该终态；
+- **组状态与逐成员结论一致**：同伴仍在推进时组为 `IN_PROGRESS`，
+  同伴全部到终态后，只要存在 `FAILED` 成员组即为 `FAILED`，绝不会在有失败成员时报 `COMPLETED`；
+- **并发/重启稳定**：并发推进同一组时，每个成员的每个阶段由 releaseId 锁保证恰好执行一次，
+  撞锁方记 `RELEASE_BUSY` 跳过；进程中断重启并恢复后，被调和成
+  `FAILED(RECOVERED_AFTER_INTERRUPT)` 的成员同样只被跳过并保留恢复原因，
+  其他成员不跳阶段、不重复部署、不状态串台。
 
 ### 并发与规模
 
@@ -327,7 +362,34 @@ mvn -o clean test
 | `ReleaseGroupFailureIsolationTest` | 组内单服务 CANARY 失败只停自己（可解释终态+失败原因），同伴照常完成；按服务回滚到各自稳定版、健康成员跳过且指针不动；组成员可用单服务接口查询/回滚 |
 | `ReleaseGroupConcurrencyTest` | 12 线程并发提交同组只建一组；30 服务一批并行推进（每成员每阶段恰好一次、无串台、逐服务指针）；6 线程并发扫组仍保持阶段恰好一次 |
 | `ReleaseGroupRecoveryTest` | 组内成员 CANARY 执行中“被 kill”，全新 Spring 上下文重启：仅该成员调和为 FAILED(RECOVERED_AFTER_INTERRUPT)，同伴原样保留并继续走完，历史事件完整 |
+| `ReleaseGroupMemberOutcomeTest` | **组级推进逐成员结论语义**：失败发生当轮即返回 `ADVANCE/ok=false`+阶段码（同伴同轮继续）；后续轮次只 `SKIPPED(RELEASE_FAILED)` 并保留原始失败阶段/码/原因；8 线程并发扫组下结论与真实状态逐轮一致、失败成员从不被报成功、每阶段恰好执行一次；模拟中断重启恢复后失败成员只跳过且不重复部署 |
 | `ReleaseGroupControllerWebTest` | 组 HTTP 端到端：提交-推进-查询全旅程、GROUP_NOT_FOUND/GROUP_DUPLICATE_SERVICE/INVALID_GROUP_REQUEST 映射 404/409/400 |
+
+> 只跑逐成员结论相关用例：`mvn -o test -Dtest='ReleaseGroupMemberOutcomeTest'`
+
+### 手动复现一次“组级推进逐成员结论（失败即报、后续跳过）”
+
+1. 提交一个三成员组：`svc-bad` 带 `faultInjection:"fail:CANARY"`，另两个成员健康；
+2. 连续推进 3 轮（BUILD → STAGING → CANARY）。第 3 轮的响应里**立刻**能看到：
+
+   ```json
+   {
+     "serviceName": "svc-bad", "action": "ADVANCE", "ok": false,
+     "code": "CANARY_HEALTH_CHECK_FAILED",
+     "message": "stage CANARY failed (CANARY_HEALTH_CHECK_FAILED): deterministic health check failed ..."
+   }
+   ```
+
+   同轮健康成员仍是 `{"action":"ADVANCE","ok":true}`，无需再 `GET /api/release-groups/<id>` 才能发现失败；
+3. 再推进任意轮次：`svc-bad` 恒为
+   `{"action":"SKIPPED","ok":false,"code":"RELEASE_FAILED",
+     "message":"member stays in terminal FAILED at stage CANARY (CANARY_HEALTH_CHECK_FAILED): ..."}`，
+   健康成员走完后组状态收敛为 `FAILED`；
+4. 并发演练：用 `ab`/`seq | xargs -P` 同时打多个 `.../advance`，
+   观察失败成员只可能是“当轮失败”或 `RELEASE_BUSY`/`RELEASE_FAILED` 跳过，从无 `ok=true`；
+5. 重启演练：把 `releases/<id>.json` 中某阶段改为 `RUNNING` 后重启（或直接用
+   `ReleaseGroupMemberOutcomeTest` 的全新上下文重启用例），恢复为
+   `FAILED(RECOVERED_AFTER_INTERRUPT)` 后继续推进，结论与第 3 步一致且该阶段不重复执行。
 
 ### 手动复现一次“失败 → 重启恢复 → 回滚”
 
@@ -344,8 +406,10 @@ mvn -o clean test
 2. 提交发布组：`svc-a` 携带新内容且 `faultInjection:"fail:CANARY"`，
    `svc-b`、`svc-c` 健康（可与 svc-a 用同一 commit、同一内容，验证相同输入各自成立）；
 3. 连续调用 `POST /api/release-groups/<groupId>/advance` 4 次：
-   观察 `svc-a` 在 CANARY 以 `FAILED` 停下（后续轮次对它记 `SKIPPED`），
-   `svc-b`、`svc-c` 一路走到 `COMPLETED`，组状态推导为 `FAILED`；
+   失败发生的那一轮响应里 `svc-a` 即为 `action=ADVANCE, ok=false`
+   （码如 `CANARY_HEALTH_CHECK_FAILED`，带失败阶段与原因），
+   之后它以 `FAILED` 停下且后续轮次恒记 `SKIPPED(RELEASE_FAILED)` 并保留原始原因；
+   `svc-b`、`svc-c` 一路走到 `COMPLETED`，组状态最终推导为 `FAILED`；
 4. 调用 `POST /api/release-groups/<groupId>/rollback`：
    只有 `svc-a` 回滚到自己的上一个稳定版本（`deployments/svc-a/current.json` 切回），
    `svc-b`、`svc-c` 记 `SKIPPED` 且部署指针不动，组状态变为 `PARTIAL`；

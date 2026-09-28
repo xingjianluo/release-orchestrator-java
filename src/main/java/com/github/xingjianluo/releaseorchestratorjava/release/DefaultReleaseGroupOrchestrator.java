@@ -11,6 +11,8 @@ import com.github.xingjianluo.releaseorchestratorjava.model.ReleaseGroupRequest;
 import com.github.xingjianluo.releaseorchestratorjava.model.ReleaseGroupView;
 import com.github.xingjianluo.releaseorchestratorjava.model.ReleaseRequest;
 import com.github.xingjianluo.releaseorchestratorjava.model.ReleaseStatus;
+import com.github.xingjianluo.releaseorchestratorjava.model.StageName;
+import com.github.xingjianluo.releaseorchestratorjava.model.StageStatus;
 import com.github.xingjianluo.releaseorchestratorjava.state.EventJournal;
 import com.github.xingjianluo.releaseorchestratorjava.state.ReleaseGroupRepository;
 import com.github.xingjianluo.releaseorchestratorjava.state.ReleaseRepository;
@@ -24,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -38,7 +41,10 @@ import java.util.concurrent.Future;
  *   <li>组身份 = 全部成员身份的确定性摘要：相同成员集合永远得到同一个 groupId，
  *       重复或并发提交同一组幂等返回既有组；</li>
  *   <li>组级推进/回滚只是“逐成员调用单服务编排 + 逐成员记录结论”，成员各自持锁、
- *       各自落盘，单个成员失败以 FAILED 终态停在自己身上，其余成员照常推进；</li>
+ *       各自落盘，单个成员失败以 FAILED 终态停在自己身上，其余成员照常推进；
+ *       推进结论严格以成员真实状态判定：阶段失败的那一轮就返回 ADVANCE/ok=false
+ *       （单服务层失败时正常返回 FAILED 发布而非抛异常，必须检查返回终态），
+ *       已在终态的成员后续轮次只记 SKIPPED 并保留原始失败原因，撞锁记 RELEASE_BUSY 跳过；</li>
  *   <li>组记录创建后不再变更，组状态由成员状态实时推导，
  *       进程中断重启后不会出现组与成员互相矛盾。</li>
  * </ul>
@@ -48,10 +54,23 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
 
     private static final Logger log = LoggerFactory.getLogger(DefaultReleaseGroupOrchestrator.class);
 
-    /** 组级推进时，成员处于这些状态视为“本轮无需动作”，记 SKIPPED 而非失败。 */
+    /**
+     * 组级推进时，成员处于这些状态视为“本轮无需/不允许动作”：
+     * 推进前按成员最新状态预检，直接记 SKIPPED，绝不再次进入单服务推进。
+     */
+    private static final Map<ReleaseStatus, String> SKIP_ADVANCE_BY_STATUS = Map.of(
+            ReleaseStatus.COMPLETED, "RELEASE_ALREADY_COMPLETED",
+            ReleaseStatus.FAILED, "RELEASE_FAILED",
+            ReleaseStatus.ROLLING_BACK, "RELEASE_ROLLING_BACK",
+            ReleaseStatus.ROLLED_BACK, "RELEASE_ROLLED_BACK");
+
+    /**
+     * 推进过程中竞态拿到这些码，同样视为本轮未执行（SKIPPED），而不是失败：
+     * 另一轮推进正在推进该成员（本轮不再插手），或单服务层的状态守卫拒绝。
+     */
     private static final Set<String> SKIP_ADVANCE_CODES = Set.of(
             "RELEASE_ALREADY_COMPLETED", "RELEASE_FAILED",
-            "RELEASE_ROLLING_BACK", "RELEASE_ROLLED_BACK");
+            "RELEASE_ROLLING_BACK", "RELEASE_ROLLED_BACK", "RELEASE_BUSY");
 
     private final ReleaseOrchestrator releaseOrchestrator;
     private final ReleaseRepository releaseRepository;
@@ -144,16 +163,7 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
     public GroupOperationResult advanceGroup(String groupId) {
         ReleaseGroup group = loadGroup(groupId);
         log.info("group advance requested groupId={} members={}", groupId, group.getMembers().size());
-        List<MemberOutcome> outcomes = runPerMember(group, "ADVANCE", member -> {
-            try {
-                releaseOrchestrator.advance(member.releaseId());
-                return MemberOutcome.success(member.serviceName(), member.releaseId(), "ADVANCE");
-            } catch (ReleaseException e) {
-                String action = SKIP_ADVANCE_CODES.contains(e.getCode()) ? "SKIPPED" : "ADVANCE";
-                return MemberOutcome.failure(member.serviceName(), member.releaseId(),
-                        action, e.getCode(), e.getMessage());
-            }
-        });
+        List<MemberOutcome> outcomes = runPerMember(group, "ADVANCE", this::advanceMember);
         journal.append(groupId, "GROUP_ADVANCE_SWEEP", summarize(outcomes));
         return new GroupOperationResult(groupId, "ADVANCE", outcomes, view(group));
     }
@@ -184,6 +194,86 @@ public class DefaultReleaseGroupOrchestrator implements ReleaseGroupOrchestrator
         });
         journal.append(groupId, "GROUP_ROLLBACK_SWEEP", summarize(outcomes));
         return new GroupOperationResult(groupId, "ROLLBACK", outcomes, view(group));
+    }
+
+    /**
+     * 单个成员一轮推进的结论判定，严格以成员发布的真实状态为准：
+     * <ol>
+     *   <li>推进前读取最新状态：终态（COMPLETED / FAILED / ROLLING_BACK / ROLLED_BACK）
+     *       直接记 SKIPPED，不调用单服务推进，不重复部署；FAILED 时把原始失败阶段、
+     *       失败码与原因原样带回结论，调用方无需再查组详情；</li>
+     *   <li>残留 RUNNING（进程中断后尚未恢复）也不重跑阶段，记 SKIPPED 并提示先恢复；</li>
+     *   <li>其余情况调用单服务推进：单服务层在阶段失败时是“正常返回 FAILED 发布”，
+     *       因此必须检查返回值的真实终态——FAILED 即本轮失败结论（带阶段与原因），
+     *       绝不能因为没抛异常就记成功；</li>
+     *   <li>与并发的另一轮推进撞锁（RELEASE_BUSY）或状态守卫拒绝：本轮未执行，
+     *       记 SKIPPED，既不算成功也不覆盖任何既有结论。</li>
+     * </ol>
+     */
+    private MemberOutcome advanceMember(ReleaseGroup.Member member) {
+        Release before = releaseRepository.find(member.releaseId())
+                .orElseThrow(() -> new ReleaseException("STATE_CORRUPT",
+                        "group member release missing: " + member.releaseId()));
+
+        String skipCode = SKIP_ADVANCE_BY_STATUS.get(before.getStatus());
+        if (skipCode != null) {
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(), "SKIPPED",
+                    skipCode, skipReason(before));
+        }
+        if (findRunningStage(before) != null) {
+            // 阶段 RUNNING 已落盘但未走恢复：说明上一轮在执行中被中断，
+            // 绝不能再次进入该阶段（否则重复部署/重复执行），等恢复把它调和成终态。
+            StageName running = findRunningStage(before);
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(), "SKIPPED",
+                    "MEMBER_INTERRUPTED_RUNNING",
+                    "member stage " + running + " is still RUNNING (process interruption);"
+                            + " run recovery before advancing again");
+        }
+
+        Release after;
+        try {
+            after = releaseOrchestrator.advance(member.releaseId());
+        } catch (ReleaseException e) {
+            if (SKIP_ADVANCE_CODES.contains(e.getCode())) {
+                return MemberOutcome.failure(member.serviceName(), member.releaseId(), "SKIPPED",
+                        e.getCode(), e.getMessage());
+            }
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                    "ADVANCE", e.getCode(), e.getMessage());
+        }
+        if (after.getStatus() == ReleaseStatus.FAILED) {
+            // 阶段在本轮执行中失败：单服务层已把它落盘为 FAILED 终态，
+            // 这一轮的逐成员结论必须是失败，并带可识别的阶段、码与原因。
+            return MemberOutcome.failure(member.serviceName(), member.releaseId(),
+                    "ADVANCE", after.getFailureCode(), failureDescription(after));
+        }
+        return MemberOutcome.success(member.serviceName(), member.releaseId(), "ADVANCE");
+    }
+
+    /** 找成员发布上残留的 RUNNING 阶段（中断未恢复标志），没有则 null。 */
+    private StageName findRunningStage(Release release) {
+        for (StageName name : StageName.ordered()) {
+            if (release.getStages().get(name).getStatus() == StageStatus.RUNNING) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** 跳过一个终态/受阻成员时，给出保留原始失败原因的可读说明。 */
+    private String skipReason(Release release) {
+        if (release.getStatus() == ReleaseStatus.FAILED) {
+            return "member stays in terminal FAILED at stage " + release.getFailureStage()
+                    + " (" + release.getFailureCode() + "): " + release.getFailureReason()
+                    + "; not re-run, roll back or submit a new release";
+        }
+        return "member is " + release.getStatus() + "; no advance action taken this round";
+    }
+
+    /** 本轮阶段失败时的结论说明：阶段 + 码 + 原因，调用方无需再查详情。 */
+    private String failureDescription(Release release) {
+        return "stage " + release.getFailureStage() + " failed ("
+                + release.getFailureCode() + "): " + release.getFailureReason();
     }
 
     /**
